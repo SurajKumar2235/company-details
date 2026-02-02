@@ -1,0 +1,11 @@
+/run/media/surajkumar/1366967307359354/test_kube/.venv/lib64/python3.14/site-packages/langchain_core/_api/deprecation.py:26: UserWarning: Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater.
+  from pydantic.v1.fields import FieldInfo as FieldInfoV1
+2026-01-31 23:40:12,407 - company_insight_service.api.app - INFO - Database signals registered
+2026-01-31 23:40:12,439 - pika.adapters.utils.connection_workflow - INFO - Pika version 1.3.2 connecting to ('::1', 5672, 0, 0)
+2026-01-31 23:40:12,440 - pika.adapters.utils.io_services_utils - INFO - Socket connected: <socket.socket fd=8, family=10, type=1, proto=6, laddr=('::1', 38164, 0, 0), raddr=('::1', 5672, 0, 0)>
+2026-01-31 23:40:12,441 - pika.adapters.utils.connection_workflow - INFO - Streaming transport linked up: (<pika.adapters.utils.io_services_utils._AsyncPlaintextTransport object at 0x7f32916b7230>, _StreamingProtocolShim: <SelectConnection PROTOCOL transport=<pika.adapters.utils.io_services_utils._AsyncPlaintextTransport object at 0x7f32916b7230> params=<URLParameters host=localhost port=5672 virtual_host=/ ssl=False>>).
+2026-01-31 23:40:12,445 - pika.adapters.utils.connection_workflow - INFO - AMQPConnector - reporting success: <SelectConnection OPEN transport=<pika.adapters.utils.io_services_utils._AsyncPlaintextTransport object at 0x7f32916b7230> params=<URLParameters host=localhost port=5672 virtual_host=/ ssl=False>>
+2026-01-31 23:40:12,445 - pika.adapters.utils.connection_workflow - INFO - AMQPConnectionWorkflow - reporting success: <SelectConnection OPEN transport=<pika.adapters.utils.io_services_utils._AsyncPlaintextTransport object at 0x7f32916b7230> params=<URLParameters host=localhost port=5672 virtual_host=/ ssl=False>>
+2026-01-31 23:40:12,446 - pika.adapters.blocking_connection - INFO - Connection workflow succeeded: <SelectConnection OPEN transport=<pika.adapters.utils.io_services_utils._AsyncPlaintextTransport object at 0x7f32916b7230> params=<URLParameters host=localhost port=5672 virtual_host=/ ssl=False>>
+2026-01-31 23:40:12,446 - pika.adapters.blocking_connection - INFO - Created channel=1
+2026-01-31 23:40:12,454 - company_insight_service.workers.consumer - INFO -  [*] Waiting for messages. To exit press CTRL+C

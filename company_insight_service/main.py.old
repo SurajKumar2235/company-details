@@ -1,0 +1,139 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+import json
+import asyncio
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
+from workflow import app_flow
+import uvicorn
+
+app = FastAPI(
+    title="Company Intelligence API",
+    description="Deep insights into companies using LangGraph, scraping, and sentiment analysis.",
+    version="2.0.0"
+)
+
+# Import signals for DB monitoring
+import signals
+
+class CompanyRequest(BaseModel):
+    company_name: str
+
+class CompanyResponse(BaseModel):
+    company: str
+    news: List[Dict]
+    product_sentiment: List[Dict]
+    stock_analysis: Optional[Dict]
+    financials: Optional[Dict]
+    note: str
+
+from services import get_monthly_events
+
+
+
+class MonthlyEventRequest(BaseModel):
+    company_name: str
+    month: str
+    year: int
+
+@app.post("/company_monthly_events")
+async def company_monthly_events(request: MonthlyEventRequest):
+    """
+    Get news and events for a company during a specific month and year.
+    """
+    if not request.company_name or not request.month or not request.year:
+        raise HTTPException(status_code=400, detail="All fields (company_name, month, year) are required")
+    
+    events = get_monthly_events(request.company_name, request.month, request.year)
+    return {
+        "company": request.company_name,
+        "period": f"{request.month} {request.year}",
+        "events": events
+    }
+
+class StockTrendRequest(BaseModel):
+    company_name: str
+    years: int = 3
+
+@app.post("/company_stock_trends")
+async def company_stock_trends(request: StockTrendRequest):
+    """
+    Analyze stock trends (dip/peak months) over a specified number of years.
+    """
+    from .services import find_ticker, get_stock_data_analysis
+    
+    if not request.company_name:
+         raise HTTPException(status_code=400, detail="company_name is required")
+         
+    ticker = find_ticker(request.company_name)
+    if not ticker:
+        raise HTTPException(status_code=404, detail=f"Ticker not found for {request.company_name}")
+        
+    analysis = get_stock_data_analysis(ticker, years=request.years)
+    if not analysis:
+        raise HTTPException(status_code=500, detail="Could not retrieve stock data.")
+        
+    return {
+        "company": request.company_name,
+        "ticker": ticker,
+        "analysis": analysis
+    }
+
+@app.post("/deep_search_company")
+async def deep_search_company(request: CompanyRequest):
+    """
+    Trigger the deep analysis workflow (LangGraph) and stream progress.
+    """
+    if not request.company_name:
+        raise HTTPException(status_code=400, detail="Company name is required")
+    
+    async def event_generator():
+        # Initial state
+        initial_state = {
+            "company_name": request.company_name,
+            "ticker": None,
+            "news": [],
+            "product_sentiment": [],
+            "stock_analysis": None,
+            "financials": None,
+            "errors": []
+        }
+        
+        try:
+            # Stream events from LangGraph
+            # LangGraph stream returns events as they happen
+            for event in app_flow.stream(initial_state):
+                # event is a dict where keys are node names and values are the state updates from that node
+                for node_name, updates in event.items():
+                    chunk = {
+                        "event": "update",
+                        "node": node_name,
+                        "data": updates
+                    }
+                    yield json.dumps(chunk) + "\n"
+                    await asyncio.sleep(0.1) # Small yielding buffer
+            
+            yield json.dumps({"event": "complete", "message": "Workflow finished. Data queued for saving."}) + "\n"
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            yield json.dumps({"event": "error", "message": str(e)}) + "\n"
+
+    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
+
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to Company Intelligence API v2. POST to /deep_search_company for deep analysis."}
+
+if __name__ == "__main__":
+    from .settings import settings
+    # Reload must be False for multiple workers
+    use_reload = settings.API_WORKERS == 1
+    uvicorn.run(
+        "company_insight_service.main:app", 
+        host="0.0.0.0", 
+        port=8000, 
+        reload=use_reload,
+        workers=settings.API_WORKERS
+    )

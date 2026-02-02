@@ -1,0 +1,47 @@
+company_insight_service/
+├── api
+│   ├── app.py
+│   ├── __init__.py
+│   └── routes
+│       ├── company.py
+│       ├── health.py
+│       └── __init__.py
+├── config
+│   ├── __init__.py
+│   └── settings.py
+├── core
+│   ├── __init__.py
+│   └── signals.py
+├── database
+│   └── models.py
+├── docker-compose.yml
+├── __init__.py
+├── main.py
+├── README.md
+├── run_api.py
+├── run_worker.py
+├── scripts
+│   ├── start_api.sh
+│   ├── start_parallel.sh
+│   └── start_workers.sh
+├── services
+│   ├── company.py
+│   ├── __init__.py
+│   ├── scraping.py
+│   ├── search.py
+│   ├── sentiment.py
+│   └── stock.py
+├── services.py
+├── start_parallel.sh
+├── tests
+│   ├── __init__.py
+│   └── test_system.py
+├── workers
+│   ├── consumer.py
+│   ├── __init__.py
+│   └── queue_utils.py
+└── workflows
+    ├── company_research.py
+    └── __init__.py
+
+11 directories, 34 files

@@ -1,0 +1,447 @@
+import requests
+from bs4 import BeautifulSoup
+try:
+    from ddgs import DDGS
+except ImportError:
+    from duckduckgo_search import DDGS
+import yfinance as yf
+import pandas as pd
+from textblob import TextBlob
+import concurrent.futures
+import re
+import math
+import logging
+import traceback
+
+from google import genai
+import os
+import json
+from dotenv import load_dotenv
+
+from settings import settings
+
+# Configure logging
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Configure Gemini Client
+gemini_client = None
+if settings.GEMINI_API_KEY:
+    try:
+        gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+    except Exception as e:
+        logger.error(f"Failed to initialize Gemini Client: {e}")
+else:
+    logger.warning("GEMINI_API_KEY not found in settings. Gemini features will be disabled.")
+
+def search_web(query, max_results=settings.DEFAULT_SEARCH_MAX_RESULTS):
+    results = []
+    logger.info(f"Searching web for: {query}")
+    try:
+        with DDGS() as ddgs:
+            search_results = list(ddgs.text(query, max_results=max_results))
+            for r in search_results:
+                results.append({
+                    "title": r.get("title"),
+                    "link": r.get("href"),
+                    "snippet": r.get("body")
+                })
+    except Exception as e:
+        logger.error(f"Error searching for {query}: {e}")
+    return results
+
+def scrape_url_content(url):
+    """
+    Goes inside the link to extract text content.
+    Includes better headers and error handling.
+    """
+    logger.debug(f"Scraping URL: {url}")
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+        }
+        response = requests.get(url, headers=headers, timeout=settings.SCRAPE_TIMEOUT)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            # Kill all script and style elements
+            for script in soup(["script", "style", "nav", "footer", "header"]):
+                script.extract()
+            text = soup.get_text()
+            # Break into lines and remove leading and trailing space on each
+            lines = (line.strip() for line in text.splitlines())
+            # Break multi-headlines into a line each
+            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+            # Drop blank lines
+            text = '\n'.join(chunk for chunk in chunks if chunk)
+            return text[:settings.SCRAPE_MAX_CHARS] # Limit to max chars from settings
+    except Exception as e:
+        logger.warning(f"Failed to scrape {url}: {e}")
+    return ""
+
+def analyze_sentiment(text):
+    """
+    Simple sentiment analysis using TextBlob.
+    Returns score (-1 to 1) and label.
+    """
+    if not text:
+        return 0, "Neutral"
+    analysis = TextBlob(text)
+    score = analysis.sentiment.polarity
+    if score > 0.1:
+        label = "Positive"
+    elif score < -0.1:
+        label = "Negative"
+    else:
+        label = "Neutral"
+    return score, label
+
+def analyze_with_gemini(text, context_query):
+    """
+    Analyzes text using Gemini API for sentiment and similarity to context.
+    Returns: {sentiment_score, sentiment_label, similarity_score}
+    """
+    if not gemini_client:
+        logger.warning("Gemini Client not initialized, falling back to basic analysis.")
+        return None
+
+    try:
+        prompt = f"""
+        Analyze the following text content extracted from a webpage.
+        Context/Search Query: "{context_query}"
+        
+        Text to Analyze:
+        "{text[:2000]}"... (truncated)
+        
+        Task:
+        1. Determine the Sentiment Score between -1.0 (Negative) and 1.0 (Positive).
+        2. Assign a Sentiment Label (Positive, Negative, Neutral).
+        3. Determine a Relevance/Similarity Score between 0.0 (Irrelevant) and 1.0 (Highly Relevant) indicating how well this text matches the intent of the Context Query.
+        
+        Return ONLY valid JSON in this format:
+        {{
+            "sentiment_score": float,
+            "sentiment_label": string,
+            "similarity_score": float,
+            "summary": "Brief 1-sentence summary of the review/opinion"
+        }}
+        """
+        
+        response = gemini_client.models.generate_content(
+            model="gemini-1.5-flash",
+            contents=prompt
+        )
+        
+        # Clean response to ensure it's valid JSON (remove markdown json blocks if any)
+        content = response.text.strip()
+        if content.startswith("```json"):
+            content = content[7:-3]
+        elif content.startswith("```"):
+            content = content[3:-3]
+            
+        return json.loads(content)
+        
+    except Exception as e:
+        logger.error(f"Gemini analysis failed: {e}")
+        return None
+
+def get_stock_data_analysis(ticker, years=3):
+    """
+    Fetches stock data for N years and analyzes trends.
+    """
+    logger.info(f"Analyzing stock for ticker: {ticker} over {years} years")
+    if not ticker:
+        return None
+        
+    end_date = pd.Timestamp.now()
+    start_date = end_date - pd.DateOffset(years=years)
+    
+    try:
+        # yfinance can be flaky with multi-threading, sometimes good to separate
+        data = yf.download(ticker, start=start_date, end=end_date, progress=False)
+        
+        # Check if data is empty or MultiIndex (yfinance update changed structure sometimes)
+        if data.empty:
+            logger.warning(f"No data found for {ticker}")
+            return None
+            
+        # Handle recent yfinance changes where columns might be (Price, Ticker)
+        if isinstance(data.columns, pd.MultiIndex):
+            try:
+                data = data.xs(ticker, level=1, axis=1)
+            except:
+                # Fallback: maybe it's just 'Close'
+                pass
+                
+        if 'Close' not in data:
+            logger.warning(f"'Close' column missing in data for {ticker}")
+            return None
+
+        close_series = data['Close']
+        if isinstance(close_series, pd.DataFrame):
+             # If it's still a dataframe (e.g. multiple tickers or structure issue), take first col
+             close_series = close_series.iloc[:, 0]
+
+        # Resample to weekly to find trends
+        weekly = close_series.resample('W').mean()
+        
+        # Simple analysis: Find months with lowest averages (dips) and highest (peaks)
+        monthly_avg = close_series.groupby(close_series.index.month).mean()
+        best_month = monthly_avg.idxmax()
+        worst_month = monthly_avg.idxmin()
+        
+        import calendar
+        best_month_name = calendar.month_name[best_month]
+        worst_month_name = calendar.month_name[worst_month]
+        
+        latest_price = close_series.iloc[-1]
+        start_price = close_series.iloc[0]
+        
+        # Ensure scalar
+        if hasattr(latest_price, 'item'): latest_price = latest_price.item()
+        if hasattr(start_price, 'item'): start_price = start_price.item()
+            
+        overall_change = ((latest_price - start_price) / start_price) * 100
+        
+        return {
+            "ticker": ticker,
+            "period_years": years,
+            "overall_change_percent": round(float(overall_change), 2),
+            "typical_dip_month": worst_month_name,
+            "typical_peak_month": best_month_name,
+            "latest_price": round(float(latest_price), 2),
+            "data_points": len(close_series)
+        }
+    except Exception as e:
+        logger.error(f"Error analyzing stock {ticker}: {e}")
+        logger.debug(traceback.format_exc())
+        return None
+
+def find_ticker(company_name):
+    logger.info(f"Finding ticker for: {company_name}")
+    
+    # 0. Check if the input itself is a valid ticker (e.g., user typed "TSLA" or "AAPL" or "SBIN")
+    if 2 <= len(company_name) <= 12 and company_name.replace('.','').isalnum():
+        logger.debug(f"Checking {company_name} as direct ticker")
+        
+        # Try direct or common suffixes (India focus as per user context)
+        variations = [company_name.upper()]
+        if not "." in company_name:
+             variations.extend([f"{company_name.upper()}.NS", f"{company_name.upper()}.BO"])
+             
+        for var in variations:
+            try:
+                 # fast check with history
+                 if not yf.Ticker(var).history(period="1d").empty:
+                     logger.info(f"Verified direct ticker: {var}")
+                     return var
+            except:
+                 pass
+
+    # 1. Search for explicit ticker association
+    queries = [
+        f"{company_name} stock ticker symbol",
+        f"what is the stock ticker for {company_name}",
+    ]
+    
+    potential_tickers = []
+    all_results = []
+    
+    for q in queries:
+        results = search_web(q, max_results=2)
+        all_results.extend(results)
+        for r in results:
+            text = (r['title'] + " " + r['snippet']).upper()
+            # Clean up text for easier matching
+            text = text.replace(":", " ").replace("-", " ")
+            
+            logger.debug(f"Ticker search text: {text[:100]}...") # Log first 100 chars
+            
+            # Pattern 1: (TICKER) - most reliable
+            matches_parenthesis = re.findall(r'\(([A-Z]{1,5})\)', text)
+            for m in matches_parenthesis:
+                if m not in ['NYSE', 'NASDAQ', 'INC', 'CORP', 'LTD', 'USA', 'UNK', 'stock']:
+                    potential_tickers.append(m)
+            
+            # Pattern 2: "Ticker SYMBOL"
+            matches_ticker_keyword = re.findall(r'TICKER\s+([A-Z]{1,5})', text)
+            potential_tickers.extend(matches_ticker_keyword)
+            
+            # Pattern 3: "Stock SYMBOL"
+            matches_stock_keyword = re.findall(r'STOCK\s+([A-Z]{1,5})', text)
+            potential_tickers.extend(matches_stock_keyword)
+            
+            # Pattern 4: NASDAQ SYMBOL or NYSE SYMBOL
+            matches_exchange = re.findall(r'(?:NASDAQ|NYSE)\s+([A-Z]{1,5})', text)
+            potential_tickers.extend(matches_exchange)
+            
+    # 2. Use Gemini to extract ticker from search results
+    if gemini_client and all_results:
+        try:
+            prompt_context = "\n".join([f"{r['title']}: {r['snippet']}" for r in all_results])
+            ticker_prompt = f"""
+            Identify the stock exchange ticker symbol for the company "{company_name}" based on the search results below.
+            
+            Search Results:
+            {prompt_context}
+            
+            Rules:
+            1. Return only the ticker symbol (e.g., "AAPL", "RELIANCE", "SBIN").
+            2. If the company is listed on Indian exchanges (NSE/BSE), prefer the base symbol (e.g., return "SBIN", not "SBIN.NS").
+            3. Ignore noise words like "PRICE", "QUOTE", "STOCK", "SYMBOL".
+            4. If multiple tickers exist, pick the most primary/liquid one.
+            5. Return JSON format: {{"ticker": "SYMBOL"}} or {{"ticker": null}} if not found.
+            """
+            
+            response = gemini_client.models.generate_content(
+                model="gemini-1.5-flash",
+                contents=ticker_prompt
+            )
+            
+            cleaned_text = response.text.replace('```json', '').replace('```', '').strip()
+            data = json.loads(cleaned_text)
+            candidate = data.get("ticker")
+            
+            if candidate:
+                logger.info(f"Gemini suggested ticker: {candidate}")
+                # Validate suggested ticker
+                suffixes = ["", ".NS", ".BO"] 
+                for suffix in suffixes:
+                     trial_ticker = candidate + suffix
+                     try:
+                        if not yf.Ticker(trial_ticker).history(period="1d").empty:
+                            logger.info(f"Verified Gemini ticker: {trial_ticker}")
+                            return trial_ticker
+                     except:
+                         pass
+        except Exception as e:
+            logger.error(f"Gemini ticker extraction failed: {e}")
+
+    # 3. Fallback: Deduced logic: Frequency count (Regex method)
+    if potential_tickers:
+        from collections import Counter
+        # Filter out common noise
+        noise = {
+            'THE', 'FOR', 'AND', 'INC', 'CORP', 'LTD', 'PLC', 'USD', 'COM',
+            'PRICE', 'QUOTE', 'STOCK', 'SYMBOL', 'TICKER', 'MARKET', 'SHARE',
+            'TRADE', 'VALUE', 'CLOSE', 'OPEN', 'HIGH', 'LOW', 'VOL', 'DATE',
+            'TIME', 'YEAR', 'MONTH', 'WEEK', 'DAY', 'EXCHA', 'TRADI', 'TICKE',
+            'SYMBO', 'CHANGE', 'PERCENT', 'COMPAN', 'GROUP', 'INDIA', 'BANK'
+        }
+        filtered = [t for t in potential_tickers if t not in noise]
+        
+        if filtered:
+            most_common = Counter(filtered).most_common(3) # Check top 3
+            
+            for candidate, _ in most_common:
+                 logger.info(f"Verifying candidate ticker: {candidate}")
+                 
+                 # list of suffixes to try
+                 suffixes = ["", ".NS", ".BO"] 
+                 
+                 for suffix in suffixes:
+                     trial_ticker = candidate + suffix
+                     try:
+                        # Lightweight validation
+                        hist = yf.Ticker(trial_ticker).history(period="1d")
+                        if not hist.empty:
+                            logger.info(f"Verified ticker: {trial_ticker}")
+                            return trial_ticker
+                     except Exception as e:
+                         pass
+        
+    logger.warning("No valid ticker found via search regex.")
+    return None
+
+def analyze_products(company_name):
+    """
+    Search for products, scrape details, and analyze sentiment concurrently.
+    """
+    logger.info(f"Analyzing products for: {company_name}")
+    search_query = f"{company_name} consumer product reviews sentiment"
+    results = search_web(search_query, max_results=5)
+    
+    analyzed_products = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        # Map scrape function to urls
+        future_to_url = {executor.submit(scrape_url_content, r['link']): r for r in results}
+        
+        for future in concurrent.futures.as_completed(future_to_url):
+            r = future_to_url[future]
+            content = ""
+            try:
+                content = future.result()
+            except Exception as e:
+                logger.warning(f"Scrape failed for {r['link']}: {e}")
+            
+            # Fallback to snippet if scraping yielded little text
+            if len(content) < 100:
+                logger.debug(f"Low content scraped for {r['link']}, using snippet.")
+                content = r.get('snippet', '') + " " + r.get('title', '')
+            
+            if content:
+                # Try Gemini first
+                gemini_result = analyze_with_gemini(content, search_query)
+                
+                if gemini_result:
+                    analyzed_products.append({
+                        "title": r['title'],
+                        "link": r['link'],
+                        "sentiment_score": gemini_result.get("sentiment_score", 0),
+                        "sentiment_label": gemini_result.get("sentiment_label", "Neutral"),
+                        "similarity_score": gemini_result.get("similarity_score", 0), # Added field
+                        "summary": gemini_result.get("summary", content[:300] + "...")
+                    })
+                else:
+                    # Fallback to TextBlob
+                    score, label = analyze_sentiment(content)
+                    analyzed_products.append({
+                        "title": r['title'],
+                        "link": r['link'],
+                        "sentiment_score": round(score, 2),
+                        "sentiment_label": label,
+                        "similarity_score": None, # Not available with TextBlob
+                        "summary": (content[:300] + "...") if len(content) > 300 else content
+                    })
+                
+    return analyzed_products
+
+def get_latest_news(company_name):
+    return search_web(f"{company_name} company latest news", max_results=5)
+
+def get_research_info(company_name):
+    return search_web(f"{company_name} company market research analysis", max_results=3)
+
+def get_monthly_events(company_name, month, year):
+    """
+    Finds specific events that happened for a company in a given month and year.
+    """
+    query = f"{company_name}  {month} {year} news"
+    logger.info(f"Searching for monthly events: {query}")
+    return search_web(query, max_results=settings.MONTHLY_EVENTS_MAX_RESULTS)
+
+
+
+def get_product_info(company_name):
+    # Try to find official product pages or summaries
+    return search_web(f"{company_name} company main products and services", max_results=4)
+
+def get_sales_data_search(company_name):
+    # Fallback or primary search for sales/revenue
+    return search_web(f"{company_name} company annual revenue sales financial report 2024", max_results=3)
+
+def gather_company_data(company_name: str):
+    return {
+        "company": company_name,
+        "news": get_latest_news(company_name),
+        "products": get_product_info(company_name),
+        "research": get_research_info(company_name),
+        "sales_data": {
+            "search_results": get_sales_data_search(company_name),
+            "note": "For precise structure, integration with paid financial APIs is recommended."
+        }
+    }

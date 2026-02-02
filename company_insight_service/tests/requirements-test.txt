@@ -1,0 +1,7 @@
+# Test Requirements
+# Add these to your requirements.txt or create a separate test-requirements.txt
+
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.0.0
+httpx>=0.24.0
